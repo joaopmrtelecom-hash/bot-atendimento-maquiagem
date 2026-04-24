@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.config import settings
+from app.services.claude import claude
 from app.services.whatsapp import whatsapp
 from app.utils.logger import logger
 
@@ -15,7 +16,6 @@ async def verify_webhook(
 ) -> int:
     """
     Verificação do webhook pela Meta (handshake inicial).
-    A Meta faz GET com esses params; temos que devolver o challenge como int.
     """
     if hub_mode == "subscribe" and hub_verify_token == settings.webhook_verify_token:
         logger.info("Webhook verificado com sucesso pela Meta")
@@ -31,9 +31,7 @@ async def verify_webhook(
 @router.post("/webhook")
 async def receive_message(request: Request) -> dict:
     """
-    Recebe eventos do WhatsApp (mensagens, status, etc.)
-    e responde 200 OK sempre — se demorar mais de 20s ou der erro,
-    a Meta reenvia o evento e duplica mensagens.
+    Recebe eventos do WhatsApp (mensagens, status, etc.).
     """
     payload = await request.json()
     logger.info(f"Webhook recebido: {payload}")
@@ -50,7 +48,6 @@ async def receive_message(request: Request) -> dict:
         value = changes[0].get("value", {})
         messages = value.get("messages", [])
 
-        # Pode ser evento de status (delivered/read), não só mensagem nova
         if not messages:
             statuses = value.get("statuses", [])
             if statuses:
@@ -62,7 +59,7 @@ async def receive_message(request: Request) -> dict:
         sender = msg.get("from")
 
         if msg_type != "text":
-            logger.info(f"Tipo '{msg_type}' ignorado no echo bot")
+            logger.info(f"Tipo '{msg_type}' ignorado no bot")
             await whatsapp.send_text(
                 to=sender,
                 body="Por enquanto só entendo mensagens de texto 🙂",
@@ -70,13 +67,15 @@ async def receive_message(request: Request) -> dict:
             return {"status": "non_text_ignored"}
 
         body = msg["text"]["body"]
-        logger.info(f"Echo: {sender} disse '{body}'")
+        logger.info(f"Mensagem recebida de {sender}: '{body}'")
 
-        await whatsapp.send_text(to=sender, body=f"Recebi: {body}")
+        # Gera resposta com Claude
+        reply = await claude.generate_reply(body)
+
+        await whatsapp.send_text(to=sender, body=reply)
 
         return {"status": "ok"}
 
     except Exception as e:
-        # NUNCA estoura exceção pro webhook — Meta reenviaria o evento
         logger.exception(f"Erro processando webhook: {e}")
         return {"status": "error", "detail": str(e)}
