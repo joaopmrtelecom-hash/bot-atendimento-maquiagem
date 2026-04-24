@@ -1,21 +1,13 @@
 """
 Cliente Claude para geração de respostas.
 
-Fase 3 (provisória): prompt genérico, sem persona ainda.
+Fase 3: persona Gisele (secretária virtual do Studio Tai Vilela).
 """
 from anthropic import AsyncAnthropic
 
 from app.config import settings
+from app.services.prompts.gisele import SYSTEM_PROMPT_GISELE
 from app.utils.logger import logger
-
-
-SYSTEM_PROMPT_PROVISORIO = """Você é uma assistente virtual de atendimento via WhatsApp.
-
-Responda com naturalidade, em português brasileiro, com tom acolhedor e profissional.
-Mantenha as respostas curtas (máximo 3 frases) e evite linguagem robótica.
-
-Por enquanto, ainda não tenho instruções específicas sobre produtos ou serviços.
-Se a pessoa perguntar algo específico, diga que vai verificar e retornará em breve."""
 
 
 class ClaudeService:
@@ -25,6 +17,7 @@ class ClaudeService:
         self.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
         self.model = settings.claude_model
         self.max_tokens = settings.claude_max_tokens
+        self.system_prompt = SYSTEM_PROMPT_GISELE
 
     async def generate_reply(self, user_message: str) -> str:
         """
@@ -36,7 +29,7 @@ class ClaudeService:
             response = await self.client.messages.create(
                 model=self.model,
                 max_tokens=self.max_tokens,
-                system=SYSTEM_PROMPT_PROVISORIO,
+                system=self.system_prompt,
                 messages=[
                     {"role": "user", "content": user_message},
                 ],
