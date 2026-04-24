@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.config import settings
 from app.services.claude import claude
+from app.services.memory import memory
 from app.services.whatsapp import whatsapp
 from app.utils.logger import logger
 
@@ -69,9 +70,18 @@ async def receive_message(request: Request) -> dict:
         body = msg["text"]["body"]
         logger.info(f"Mensagem recebida de {sender}: '{body}'")
 
-        # Gera resposta com Claude
-        reply = await claude.generate_reply(body)
+        # Carrega histórico anterior (sem incluir a mensagem atual)
+        history = memory.get_history(sender)
+        logger.info(f"Histórico carregado | {sender} | {len(history)} mensagens")
 
+        # Gera resposta considerando o contexto
+        reply = await claude.generate_reply(user_message=body, history=history)
+
+        # Persiste ambas as mensagens no histórico
+        memory.add(sender, "user", body)
+        memory.add(sender, "assistant", reply)
+
+        # Envia resposta pro WhatsApp
         await whatsapp.send_text(to=sender, body=reply)
 
         return {"status": "ok"}
