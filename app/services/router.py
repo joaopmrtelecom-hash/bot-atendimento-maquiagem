@@ -1,14 +1,13 @@
 """
-Roteador de intent — classifica a mensagem da cliente e direciona pro agente certo.
+Roteador de intent — classifica e direciona mensagens da cliente.
 
-Fluxo:
-1. Lê intent atual do banco (default 'unknown')
-2. Se intent já é de serviço (social, noiva, etc.), mantém — não re-classifica
-   (decisão arquitetural: roteador roda só na 1ª mensagem)
-3. Se intent é 'unknown', chama o classifier silencioso pra ver se a mensagem
-   atual já permite identificar o serviço
-4. Se o classifier retornar 'human', registra e bot fica em silêncio
-5. Retorna a intent final pra usar na resposta
+Regras de stickiness:
+- Se intent atual é um serviço (social/noiva/debut/automaq/vip): sticky.
+  Não re-classifica em mensagens subsequentes.
+- Se intent atual é `human`: NÃO sticky. Re-classifica toda mensagem para
+  detectar se a cliente fez uma objeção (vira `objection_followup`) ou
+  continua sendo coisa pra humano.
+- Se intent atual é `unknown`: classifica.
 """
 import json
 
@@ -20,8 +19,11 @@ from app.services.prompts.classifier import CLASSIFIER_SYSTEM_PROMPT
 from app.utils.logger import logger
 
 
-# Intents que o bot já sabe atender (Fase 4.1: só social)
-IMPLEMENTED_INTENTS: set[Intent] = {"social"}
+# Intents que o bot já sabe atender (Fase 4.1: social + objection_followup)
+IMPLEMENTED_INTENTS: set[Intent] = {"social", "objection_followup"}
+
+# Intents onde o classifier precisa rodar mesmo se já houver intent atual
+RECLASSIFY_INTENTS: set[Intent] = {"human", "objection_followup"}
 
 
 class IntentRouter:
@@ -34,26 +36,16 @@ class IntentRouter:
         self,
         wa_id: str,
         user_message: str,
-        recent_context: str | None = None,
+        current_intent: Intent,
     ) -> Intent:
         """
-        Classifica a mensagem da cliente. Retorna uma intent.
-
-        Args:
-            wa_id: ID do WhatsApp da cliente
-            user_message: a mensagem atual
-            recent_context: contexto resumido do histórico recente (opcional)
-
-        Returns:
-            Intent identificada.
+        Classifica a mensagem atual considerando a intent atual.
         """
-        # Monta a mensagem pro classifier
-        prompt = f"Mensagem: {user_message!r}"
-        if recent_context:
-            prompt += f"\nContexto atual: {recent_context}"
-        else:
-            prompt += "\nContexto atual: nenhum"
-        prompt += '\n\nResponda APENAS com o JSON. Exemplo: {"intent": "social"}'
+        prompt = (
+            f"Mensagem: {user_message!r}\n"
+            f"Intent atual: {current_intent}\n\n"
+            'Responda APENAS com o JSON. Exemplo: {"intent": "social"}'
+        )
 
         try:
             response = await self.client.messages.create(
@@ -68,27 +60,23 @@ class IntentRouter:
                 f"input_tokens={response.usage.input_tokens} "
                 f"output_tokens={response.usage.output_tokens} | raw={raw!r}"
             )
-
-            # Parsear o JSON com tolerância a markdown ou texto extra
-            intent = self._extract_intent(raw)
-            return intent
+            return self._extract_intent(raw)
 
         except Exception as e:
             logger.exception(f"Erro no classifier: {e}")
-            return "unknown"  # falha = mantém genérico
+            return current_intent if current_intent != "unknown" else "unknown"
 
     def _extract_intent(self, raw: str) -> Intent:
-        """
-        Extrai a intent de uma resposta do classifier.
-        Tolera respostas com markdown ou whitespace extra.
-        """
-        # Remove possíveis cercas de markdown
+        """Extrai a intent de uma resposta do classifier (tolera markdown extra)."""
         cleaned = raw.replace("```json", "").replace("```", "").strip()
 
         try:
             data = json.loads(cleaned)
             intent = data.get("intent", "unknown")
-            valid_intents = {"unknown", "social", "noiva", "debut", "automaq", "vip", "human"}
+            valid_intents = {
+                "unknown", "social", "noiva", "debut",
+                "automaq", "vip", "human", "objection_followup",
+            }
             if intent not in valid_intents:
                 logger.warning(f"Intent inválida do classifier: {intent!r}")
                 return "unknown"
@@ -101,18 +89,31 @@ class IntentRouter:
         """
         Decide a intent ativa pra essa conversa.
 
-        Lógica sticky: se cliente já tem intent definida (que não seja unknown),
-        respeita. Só classifica se ainda for unknown.
+        Lógica:
+        - Se intent atual é unknown ou human: classifica.
+          (Em human, o classifier pode reativar o bot via objection_followup ou
+          confirmar que continua human.)
+        - Se intent é um serviço (social, noiva, etc.): sticky, não re-classifica.
+        - objection_followup nunca é "sticky" — vira intent só para a resposta atual,
+          depois volta a ser human (gerenciado no webhook).
         """
         current = memory.get_current_intent(wa_id)
 
-        if current != "unknown":
+        # Sticky: se intent é serviço implementado e não é human/objection_followup, mantém
+        if current not in {"unknown", "human", "objection_followup"}:
             logger.info(f"Intent sticky | wa_id={wa_id} | intent={current}")
             return current
 
-        # Cliente nova ou ainda sem intent definida — classifica
-        new_intent = await self.classify(wa_id=wa_id, user_message=user_message)
-        logger.info(f"Intent classificada | wa_id={wa_id} | intent={new_intent}")
+        # Re-classifica
+        new_intent = await self.classify(
+            wa_id=wa_id,
+            user_message=user_message,
+            current_intent=current,
+        )
+        logger.info(
+            f"Intent classificada | wa_id={wa_id} | "
+            f"anterior={current} | nova={new_intent}"
+        )
         return new_intent
 
     @staticmethod

@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from app.config import settings
 from app.services.claude import claude
 from app.services.memory import Intent, memory
+from app.services.prompts.objection_followup import OBJECTION_FOLLOWUP_SYSTEM_PROMPT
 from app.services.prompts.social import SOCIAL_SYSTEM_PROMPT
 from app.services.prompts.welcome import WELCOME_SYSTEM_PROMPT
 from app.services.router import router as intent_router
@@ -12,10 +13,32 @@ from app.utils.logger import logger
 router = APIRouter()
 
 
+# Frases que indicam o handoff do social para humano
+_HANDOFF_MARKERS = (
+    "conferindo a agenda",
+    "conferindo nossa agenda",
+    "verificando a agenda",
+    "verificando nossa agenda",
+    "já te passo os horários",
+    "ja te passo os horarios",
+)
+
+
+def _is_social_handoff(reply: str) -> bool:
+    """
+    Detecta se a resposta do agente social é a mensagem de encerramento
+    (etapa 5: 'estou conferindo a agenda'). Quando essa mensagem é detectada,
+    a intent migra de 'social' para 'human' — bot silencia ou responde só objeções.
+    """
+    lower = reply.lower()
+    return any(marker in lower for marker in _HANDOFF_MARKERS)
+
+
 # Mapeia intent -> (system_prompt, nome_do_agente)
 AGENT_PROMPTS: dict[Intent, tuple[str, str]] = {
     "unknown": (WELCOME_SYSTEM_PROMPT, "welcome"),
     "social": (SOCIAL_SYSTEM_PROMPT, "social"),
+    "objection_followup": (OBJECTION_FOLLOWUP_SYSTEM_PROMPT, "objection_followup"),
     # Próximos a implementar:
     # "noiva": (NOIVA_SYSTEM_PROMPT, "noiva"),
     # "debut": (DEBUT_SYSTEM_PROMPT, "debut"),
@@ -44,7 +67,7 @@ async def verify_webhook(
 
 @router.post("/webhook")
 async def receive_message(request: Request) -> dict:
-    """Recebe eventos do WhatsApp (mensagens, status, etc.)."""
+    """Recebe eventos do WhatsApp."""
     payload = await request.json()
     logger.info(f"Webhook recebido: {payload}")
 
@@ -81,36 +104,38 @@ async def receive_message(request: Request) -> dict:
         body = msg["text"]["body"]
         logger.info(f"Mensagem recebida de {sender}: '{body}'")
 
-        # 1) Roteia: identifica ou recupera intent atual
+        # 1) Roteia
         intent = await intent_router.route(wa_id=sender, user_message=body)
 
-        # 2) Se intent é 'human' ou um serviço ainda não implementado,
-        #    o bot fica em silêncio. A secretária real assume.
+        # 2) Silenciar se intent é human ou serviço não-implementado
         if intent == "human" or (
-            intent != "unknown" and not intent_router.is_implemented(intent)
+            intent not in {"unknown", "objection_followup"}
+            and not intent_router.is_implemented(intent)
         ):
             logger.info(
-                f"Bot silencia | wa_id={sender} | intent={intent} "
-                f"(humano deve assumir)"
+                f"Bot silencia | wa_id={sender} | intent={intent}"
             )
-            # Persiste a mensagem da cliente, mas NÃO responde nem persiste resposta do bot.
-            # A resposta humana, quando vier, será uma mensagem de fora do bot.
             memory.add(sender, "user", body)
-            # Registra a intent num "marcador" — uma assistant message vazia com a intent.
-            # Isso garante sticky: próxima mensagem da cliente continua roteando como
-            # 'human' / serviço-não-implementado e mantendo o bot calado.
-            memory.add(sender, "assistant", "[bot silenciou — humano assumiu]", intent=intent)
+            memory.add(
+                sender,
+                "assistant",
+                "[bot silenciou — humano assumiu]",
+                intent=intent,
+            )
             return {"status": "silenced", "intent": intent}
 
-        # 3) Carrega histórico e dispara o agente correspondente
+        # 3) Carrega histórico (filtra marcadores)
         history = memory.get_history(sender)
-        # Filtra mensagens marcadoras vazias do histórico (não mandar pro Claude)
-        history = [m for m in history if m["content"] != "[bot silenciou — humano assumiu]"]
+        history = [
+            m for m in history
+            if m["content"] != "[bot silenciou — humano assumiu]"
+        ]
         logger.info(
             f"Histórico carregado | wa_id={sender} | "
             f"{len(history)} mensagens | intent={intent}"
         )
 
+        # 4) Dispara agente correspondente
         system_prompt, agent_name = AGENT_PROMPTS[intent]
         reply = await claude.generate_reply(
             system_prompt=system_prompt,
@@ -119,11 +144,22 @@ async def receive_message(request: Request) -> dict:
             agent_name=agent_name,
         )
 
-        # 4) Persiste mensagens (intent fica registrada na resposta do bot)
-        memory.add(sender, "user", body)
-        memory.add(sender, "assistant", reply, intent=intent)
+        # 5) Persiste mensagens.
+        # Detecção: se o agente social terminou com "estou conferindo a agenda",
+        # marca intent como 'human' na resposta — nas próximas mensagens, o bot
+        # silencia ou responde objeções.
+        intent_to_save: Intent = intent
+        if intent == "social" and _is_social_handoff(reply):
+            logger.info(
+                f"Handoff detectado | wa_id={sender} | "
+                f"intent migrada de 'social' → 'human'"
+            )
+            intent_to_save = "human"
 
-        # 5) Envia resposta
+        memory.add(sender, "user", body)
+        memory.add(sender, "assistant", reply, intent=intent_to_save)
+
+        # 6) Envia resposta
         await whatsapp.send_text(to=sender, body=reply)
 
         return {"status": "ok", "intent": intent, "agent": agent_name}

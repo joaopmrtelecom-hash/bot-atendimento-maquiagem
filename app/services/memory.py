@@ -5,8 +5,9 @@ Armazena mensagens e intent atual de cada cliente indexado pelo wa_id.
 
 Esquema:
 - messages(id, wa_id, role, content, intent, timestamp)
-- intent é registrado em cada mensagem do bot pra rastrear histórico de roteamento
-- a intent ATUAL de uma conversa é a intent da última mensagem do bot
+- intent é registrada em cada mensagem do bot pra rastrear histórico
+- a intent "atual" de uma conversa é a intent da última mensagem do bot
+  (excluindo objection_followup, que é transitória — não vira sticky)
 """
 import sqlite3
 from contextlib import contextmanager
@@ -18,13 +19,14 @@ from app.utils.logger import logger
 
 
 Role = Literal["user", "assistant"]
-Intent = Literal["unknown", "social", "noiva", "debut", "automaq", "vip", "human"]
+Intent = Literal[
+    "unknown", "social", "noiva", "debut", "automaq", "vip",
+    "human", "objection_followup",
+]
 
 
 class ConversationMemory:
-    """
-    Gerencia o histórico de conversas e intent persistida por cliente.
-    """
+    """Gerencia o histórico de conversas e intent persistida por cliente."""
 
     def __init__(self, db_path: str | None = None) -> None:
         self.db_path = Path(db_path or settings.memory_db_path)
@@ -32,7 +34,6 @@ class ConversationMemory:
 
     @contextmanager
     def _conn(self):
-        """Context manager que abre conexão, faz commit e fecha."""
         conn = sqlite3.connect(self.db_path, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
@@ -59,7 +60,7 @@ class ConversationMemory:
                 ON messages(wa_id, timestamp)
             """)
 
-            # Migração: adiciona coluna intent se não existir (DB criado na Fase 3.5)
+            # Migração: adiciona coluna intent se não existir
             cols = conn.execute("PRAGMA table_info(messages)").fetchall()
             col_names = {c["name"] for c in cols}
             if "intent" not in col_names:
@@ -75,10 +76,7 @@ class ConversationMemory:
         content: str,
         intent: Intent | None = None,
     ) -> None:
-        """
-        Adiciona uma mensagem ao histórico. Se for mensagem do assistant,
-        registra a intent que estava ativa no momento.
-        """
+        """Adiciona uma mensagem ao histórico."""
         with self._conn() as conn:
             conn.execute(
                 "INSERT INTO messages (wa_id, role, content, intent) VALUES (?, ?, ?, ?)",
@@ -89,7 +87,7 @@ class ConversationMemory:
         self, wa_id: str, limit: int | None = None
     ) -> list[dict[str, str]]:
         """
-        Retorna as últimas N mensagens do cliente em ordem cronológica crescente,
+        Retorna as últimas N mensagens em ordem cronológica crescente,
         no formato esperado pela Anthropic API.
         """
         limit = limit or settings.memory_max_messages
@@ -110,14 +108,19 @@ class ConversationMemory:
 
     def get_current_intent(self, wa_id: str) -> Intent:
         """
-        Retorna a intent da última mensagem do bot pra esse cliente.
-        Se não houver, retorna 'unknown'.
+        Retorna a intent "estável" mais recente da conversa.
+
+        Ignora objection_followup, que é transitória — depois de uma resposta
+        de objeção, a intent estável continua sendo human.
         """
         with self._conn() as conn:
             row = conn.execute(
                 """
                 SELECT intent FROM messages
-                WHERE wa_id = ? AND role = 'assistant' AND intent IS NOT NULL
+                WHERE wa_id = ?
+                  AND role = 'assistant'
+                  AND intent IS NOT NULL
+                  AND intent != 'objection_followup'
                 ORDER BY timestamp DESC
                 LIMIT 1
                 """,
@@ -126,7 +129,6 @@ class ConversationMemory:
         return row["intent"] if row else "unknown"
 
     def count(self, wa_id: str) -> int:
-        """Total de mensagens armazenadas pra um cliente."""
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) AS c FROM messages WHERE wa_id = ?", (wa_id,)
@@ -134,7 +136,7 @@ class ConversationMemory:
         return row["c"] if row else 0
 
     def clear(self, wa_id: str) -> int:
-        """Apaga todo o histórico de um cliente. Retorna quantas foram apagadas."""
+        """Apaga todo o histórico de um cliente."""
         with self._conn() as conn:
             cur = conn.execute("DELETE FROM messages WHERE wa_id = ?", (wa_id,))
             return cur.rowcount
