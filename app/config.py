@@ -22,13 +22,16 @@ class Settings(BaseSettings):
     graph_api_version: str = "v21.0"
     graph_api_base: str = "https://graph.facebook.com"
 
-    # Claude
+    # Claude — modelo principal (agentes especializados)
     claude_model: str = "claude-sonnet-4-5"
     claude_max_tokens: int = 1024
 
-    # Memória de conversa (Fase 3.5)
+    # Claude — modelo do classifier (mais barato, só classifica intent)
+    classifier_model: str = "claude-haiku-4-5-20251001"
+
+    # Memória de conversa
     memory_db_path: str = "data/conversations.db"
-    memory_max_messages: int = 20  # últimas N mensagens por cliente
+    memory_max_messages: int = 20
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
