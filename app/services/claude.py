@@ -1,15 +1,17 @@
 """
 Cliente Claude para geração de respostas.
 
-Fase 4.1: aceita system prompt dinâmico para suportar múltiplos agentes
-(welcome, social, noiva, debut, automaq, vip).
-
-O agente certo é escolhido pelo router antes da chamada.
+Aceita system prompt dinâmico para suportar múltiplos agentes
+(welcome, social, objection_followup, e futuros: noiva, debut, automaq, vip).
 """
 from anthropic import AsyncAnthropic
 
 from app.config import settings
 from app.utils.logger import logger
+
+
+# Comprimento máximo do reply a logar (evita poluir log com mensagens longas)
+REPLY_LOG_PREVIEW = 200
 
 
 class ClaudeService:
@@ -35,7 +37,6 @@ class ClaudeService:
             user_message: mensagem atual da cliente.
             history: lista de mensagens anteriores no formato
                 [{"role": "user" | "assistant", "content": "..."}].
-                Em ordem cronológica crescente, sem incluir a mensagem atual.
             agent_name: identificador do agente pra log (ex: "welcome", "social").
 
         Returns:
@@ -54,10 +55,15 @@ class ClaudeService:
 
             reply = response.content[0].text.strip()
 
+            # Preview da resposta no log (truncado pra não poluir)
+            preview = reply.replace("\n", " ↵ ")
+            if len(preview) > REPLY_LOG_PREVIEW:
+                preview = preview[:REPLY_LOG_PREVIEW] + "..."
+
             logger.info(
                 f"Agente {agent_name!r} respondeu | msgs_context={len(messages)} | "
                 f"input_tokens={response.usage.input_tokens} "
-                f"output_tokens={response.usage.output_tokens}"
+                f"output_tokens={response.usage.output_tokens} | reply={preview!r}"
             )
 
             return reply

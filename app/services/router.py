@@ -8,6 +8,10 @@ Regras de stickiness:
   detectar se a cliente fez uma objeção (vira `objection_followup`) ou
   continua sendo coisa pra humano.
 - Se intent atual é `unknown`: classifica.
+
+O classifier recebe como contexto as últimas 4 mensagens da conversa,
+para resolver ambiguidades em respostas curtas (ex: "social" sozinho,
+"festa", "noiva" — sem contexto, parecem genéricos; com contexto, ficam claros).
 """
 import json
 
@@ -22,8 +26,8 @@ from app.utils.logger import logger
 # Intents que o bot já sabe atender (Fase 4.1: social + objection_followup)
 IMPLEMENTED_INTENTS: set[Intent] = {"social", "objection_followup"}
 
-# Intents onde o classifier precisa rodar mesmo se já houver intent atual
-RECLASSIFY_INTENTS: set[Intent] = {"human", "objection_followup"}
+# Quantas mensagens recentes mandar como contexto pro classifier
+CLASSIFIER_CONTEXT_SIZE = 4
 
 
 class IntentRouter:
@@ -39,10 +43,34 @@ class IntentRouter:
         current_intent: Intent,
     ) -> Intent:
         """
-        Classifica a mensagem atual considerando a intent atual.
+        Classifica a mensagem atual considerando a intent atual e o contexto
+        recente da conversa.
         """
+        # Carrega últimas N mensagens pra dar contexto
+        recent = memory.get_history(wa_id, limit=CLASSIFIER_CONTEXT_SIZE)
+        # Filtra marcadores internos
+        recent = [
+            m for m in recent
+            if m["content"] != "[bot silenciou — humano assumiu]"
+        ]
+
+        # Monta contexto legível
+        if recent:
+            context_lines = []
+            for m in recent:
+                who = "Cliente" if m["role"] == "user" else "Atendente"
+                # Trunca conteúdo muito longo pra economizar tokens no classifier
+                content = m["content"]
+                if len(content) > 300:
+                    content = content[:300] + "..."
+                context_lines.append(f"{who}: {content}")
+            context_str = "\n".join(context_lines)
+        else:
+            context_str = "(nenhuma mensagem anterior)"
+
         prompt = (
-            f"Mensagem: {user_message!r}\n"
+            f"Histórico recente da conversa:\n{context_str}\n\n"
+            f"Mensagem atual da cliente: {user_message!r}\n"
             f"Intent atual: {current_intent}\n\n"
             'Responda APENAS com o JSON. Exemplo: {"intent": "social"}'
         )
@@ -91,15 +119,12 @@ class IntentRouter:
 
         Lógica:
         - Se intent atual é unknown ou human: classifica.
-          (Em human, o classifier pode reativar o bot via objection_followup ou
-          confirmar que continua human.)
-        - Se intent é um serviço (social, noiva, etc.): sticky, não re-classifica.
-        - objection_followup nunca é "sticky" — vira intent só para a resposta atual,
-          depois volta a ser human (gerenciado no webhook).
+        - Se intent é um serviço (social, noiva, etc.): sticky.
+        - objection_followup nunca é "sticky" — é transitória.
         """
         current = memory.get_current_intent(wa_id)
 
-        # Sticky: se intent é serviço implementado e não é human/objection_followup, mantém
+        # Sticky: serviço implementado mantém
         if current not in {"unknown", "human", "objection_followup"}:
             logger.info(f"Intent sticky | wa_id={wa_id} | intent={current}")
             return current
