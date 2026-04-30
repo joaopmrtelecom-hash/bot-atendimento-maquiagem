@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     memory_db_path: str = "data/conversations.db"
     memory_max_messages: int = 20
 
+    # Google Calendar (Fase 4.2)
+    google_credentials_path: str
+    google_calendar_id: str
+    studio_timezone: str = "America/Sao_Paulo"
+    studio_open_hour: int = 7
+    studio_close_hour: int = 22
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 

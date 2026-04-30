@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.core.webhook import router as webhook_router
+from app.services.calendar import calendar_service
 from app.services.memory import memory
 from app.utils.logger import logger
 
@@ -12,9 +13,18 @@ async def lifespan(app: FastAPI):
     """Executado no startup e shutdown da aplicação."""
     # Startup
     memory.init_db()
+
+    # Healthcheck do Google Calendar (não bloqueia startup, só loga warning)
+    if not calendar_service.healthcheck():
+        logger.warning(
+            "Google Calendar healthcheck FAILED. "
+            "Bot vai subir, mas tool 'verificar_disponibilidade' vai falhar. "
+            "Verifique credenciais e compartilhamento do calendário."
+        )
+
     logger.info("Bot inicializado")
     yield
-    # Shutdown (nada por enquanto)
+    # Shutdown
 
 
 app = FastAPI(
