@@ -1,12 +1,18 @@
 """
 Cliente Google Calendar (read-only).
 
-Consulta a agenda da Tai pra verificar disponibilidade. Suporta:
-- Bloqueio por sobreposição: qualquer evento que cruza o intervalo solicitado
-- Bloqueio por dia: evento all-day bloqueia o dia inteiro
-- Janela de horário comercial (STUDIO_OPEN_HOUR a STUDIO_CLOSE_HOUR)
+Consulta a agenda da Tai pra verificar disponibilidade.
 
-Usa Service Account autenticada via JSON em settings.google_credentials_path.
+A regra de busca é "janela de 5h antes do horário de prontidão":
+- Cliente diz "preciso estar pronta às X"
+- Bot busca qualquer slot de duração D minutos dentro do intervalo
+  [max(open_hour, X - lookback_hours), X]
+- Se houver ao menos um slot livre nessa janela, está disponível
+
+Bloqueios:
+- Eventos de horário específico bloqueiam por sobreposição
+- Eventos all-day bloqueiam o dia inteiro
+- Slots fora do horário comercial são descartados
 """
 from __future__ import annotations
 
@@ -23,6 +29,12 @@ from app.utils.logger import logger
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 
+# Janela de busca antes do horário de prontidão (em horas)
+DEFAULT_LOOKBACK_HOURS = 5
+
+# Granularidade dos slots considerados (em minutos). 30min é comum.
+SLOT_STEP_MINUTES = 30
+
 
 class CalendarService:
     """Cliente Google Calendar somente leitura."""
@@ -32,10 +44,9 @@ class CalendarService:
         self.timezone = ZoneInfo(settings.studio_timezone)
         self.open_hour = settings.studio_open_hour
         self.close_hour = settings.studio_close_hour
-        self._service = None  # build lazy
+        self._service = None
 
     def _get_service(self):
-        """Constrói o cliente da API na primeira chamada e reutiliza."""
         if self._service is None:
             creds = Credentials.from_service_account_file(
                 settings.google_credentials_path,
@@ -45,11 +56,7 @@ class CalendarService:
         return self._service
 
     def healthcheck(self) -> bool:
-        """
-        Verifica se a integração está funcional.
-        Retorna True se conseguir listar metadata do calendário.
-        Use no startup pra falhar rápido em caso de credencial errada.
-        """
+        """Verifica se a integração está funcional."""
         try:
             service = self._get_service()
             cal = service.calendars().get(calendarId=self.calendar_id).execute()
@@ -59,7 +66,7 @@ class CalendarService:
             )
             return True
         except HttpError as e:
-            logger.error(f"Google Calendar falhou no healthcheck: HTTP {e.status_code} {e.reason}")
+            logger.error(f"Google Calendar healthcheck: HTTP {e.status_code} {e.reason}")
             return False
         except FileNotFoundError as e:
             logger.error(f"Credencial JSON não encontrada: {e}")
@@ -68,130 +75,194 @@ class CalendarService:
             logger.exception(f"Google Calendar healthcheck error: {e}")
             return False
 
-    def is_available(
+    def _fetch_day_events(self, target_date: date) -> tuple[bool, list[tuple[datetime, datetime]]]:
+        """
+        Busca eventos do dia.
+
+        Returns:
+            (all_day_blocked, busy_intervals)
+            - all_day_blocked: True se houver evento all-day no dia
+            - busy_intervals: lista de (start, end) timezone-aware, em SP
+        """
+        day_start = datetime.combine(target_date, time.min, tzinfo=self.timezone)
+        day_end = datetime.combine(target_date, time.max, tzinfo=self.timezone)
+
+        service = self._get_service()
+        result = service.events().list(
+            calendarId=self.calendar_id,
+            timeMin=day_start.isoformat(),
+            timeMax=day_end.isoformat(),
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=50,
+        ).execute()
+
+        events = result.get("items", [])
+        logger.info(
+            f"Calendar | data={target_date} | eventos_encontrados={len(events)}"
+        )
+
+        all_day_blocked = False
+        busy: list[tuple[datetime, datetime]] = []
+
+        for ev in events:
+            start = ev.get("start", {})
+            end = ev.get("end", {})
+
+            if "date" in start and "dateTime" not in start:
+                # All-day event: bloqueia o dia inteiro
+                all_day_blocked = True
+                logger.info(
+                    f"Calendar | all-day event detectado: {ev.get('summary', '(sem título)')!r}"
+                )
+                continue
+
+            if "dateTime" not in start or "dateTime" not in end:
+                continue
+
+            ev_start = datetime.fromisoformat(start["dateTime"]).astimezone(self.timezone)
+            ev_end = datetime.fromisoformat(end["dateTime"]).astimezone(self.timezone)
+            busy.append((ev_start, ev_end))
+
+        return all_day_blocked, busy
+
+    def _slot_overlaps_busy(
         self,
-        start_dt: datetime,
+        slot_start: datetime,
+        slot_end: datetime,
+        busy_intervals: list[tuple[datetime, datetime]],
+    ) -> bool:
+        """Retorna True se o slot sobrepõe algum intervalo ocupado."""
+        for ev_start, ev_end in busy_intervals:
+            if slot_start < ev_end and slot_end > ev_start:
+                return True
+        return False
+
+    def find_available_slot(
+        self,
+        ready_dt: datetime,
         duration_minutes: int = 60,
+        lookback_hours: int = DEFAULT_LOOKBACK_HOURS,
     ) -> dict:
         """
-        Verifica disponibilidade pra atender em [start_dt, start_dt + duration].
+        Verifica se há ao menos um slot livre na janela de busca.
 
-        Retorna um dict com:
+        Args:
+            ready_dt: horário em que a cliente precisa estar pronta (timezone-aware ou naive em SP)
+            duration_minutes: duração do atendimento (default 60min)
+            lookback_hours: quantas horas antes do `ready_dt` aceitar como início válido
+
+        Returns:
             {
                 "available": bool,
-                "reason": "ok" | "fora_horario_comercial" | "dia_bloqueado" | "horario_ocupado" | "erro",
-                "details": str  # explicação humana opcional
+                "reason": "ok" | "fora_horario_comercial" | "dia_bloqueado"
+                          | "horario_ocupado" | "erro",
+                "details": str
             }
 
-        Considera ocupado se:
-        - Houver evento all-day no dia (bloqueio do dia inteiro)
-        - Houver evento sobrepondo o intervalo
-        - O horário estiver fora da janela comercial
+        Não retorna a lista de slots livres (decisão de produto: humano oferece depois).
         """
-        # Garante timezone-awareness
-        if start_dt.tzinfo is None:
-            start_dt = start_dt.replace(tzinfo=self.timezone)
+        # Garante timezone-aware
+        if ready_dt.tzinfo is None:
+            ready_dt = ready_dt.replace(tzinfo=self.timezone)
         else:
-            start_dt = start_dt.astimezone(self.timezone)
+            ready_dt = ready_dt.astimezone(self.timezone)
 
-        end_dt = start_dt + timedelta(minutes=duration_minutes)
+        # Define janela [window_start, window_end]
+        # window_end = ready_dt (último momento aceito como FIM do atendimento)
+        # window_start = max(open_hour do dia, ready_dt - lookback_hours)
+        target_date = ready_dt.date()
+        day_open = datetime.combine(
+            target_date, time(self.open_hour, 0), tzinfo=self.timezone
+        )
+        day_close = datetime.combine(
+            target_date, time(self.close_hour, 0), tzinfo=self.timezone
+        )
+        window_end = ready_dt
+        window_start = max(day_open, ready_dt - timedelta(hours=lookback_hours))
 
-        # 1. Verifica horário comercial (start E end devem estar dentro)
-        if (
-            start_dt.hour < self.open_hour
-            or end_dt.hour > self.close_hour
-            or (end_dt.hour == self.close_hour and end_dt.minute > 0)
-        ):
+        # Sanity: ready_dt precisa estar dentro do horário comercial
+        if ready_dt < day_open or ready_dt > day_close:
             return {
                 "available": False,
                 "reason": "fora_horario_comercial",
                 "details": (
                     f"Atendimento das {self.open_hour}h às {self.close_hour}h. "
-                    f"Solicitado: {start_dt.strftime('%H:%M')} até {end_dt.strftime('%H:%M')}."
+                    f"Solicitado estar pronta às {ready_dt.strftime('%H:%M')}."
                 ),
             }
 
-        # 2. Busca eventos do dia
-        try:
-            day_start = datetime.combine(start_dt.date(), time.min, tzinfo=self.timezone)
-            day_end = datetime.combine(start_dt.date(), time.max, tzinfo=self.timezone)
-
-            service = self._get_service()
-            result = service.events().list(
-                calendarId=self.calendar_id,
-                timeMin=day_start.isoformat(),
-                timeMax=day_end.isoformat(),
-                singleEvents=True,
-                orderBy="startTime",
-                maxResults=50,
-            ).execute()
-
-            events = result.get("items", [])
-            logger.info(
-                f"Calendar | data={start_dt.date()} | "
-                f"eventos_encontrados={len(events)}"
-            )
-
-            # 3. Verifica all-day events (bloqueia o dia inteiro)
-            for ev in events:
-                start = ev.get("start", {})
-                if "date" in start and "dateTime" not in start:
-                    # all-day: campo 'date' (sem 'dateTime')
-                    return {
-                        "available": False,
-                        "reason": "dia_bloqueado",
-                        "details": (
-                            f"Há um evento de dia inteiro na agenda em {start_dt.date()}: "
-                            f"{ev.get('summary', '(sem título)')!r}"
-                        ),
-                    }
-
-            # 4. Verifica sobreposição com eventos de horário específico
-            for ev in events:
-                start = ev.get("start", {})
-                end = ev.get("end", {})
-                if "dateTime" not in start:
-                    continue  # pula all-day (já tratado)
-
-                ev_start = datetime.fromisoformat(start["dateTime"]).astimezone(self.timezone)
-                ev_end = datetime.fromisoformat(end["dateTime"]).astimezone(self.timezone)
-
-                # Sobreposição: start < ev_end E end > ev_start
-                if start_dt < ev_end and end_dt > ev_start:
-                    return {
-                        "available": False,
-                        "reason": "horario_ocupado",
-                        "details": (
-                            f"Conflito com evento existente: "
-                            f"{ev.get('summary', '(sem título)')!r} "
-                            f"das {ev_start.strftime('%H:%M')} às {ev_end.strftime('%H:%M')}."
-                        ),
-                    }
-
-            # 5. Tudo livre
+        # Sanity: precisa caber pelo menos UM slot na janela
+        if window_end - window_start < timedelta(minutes=duration_minutes):
             return {
-                "available": True,
-                "reason": "ok",
+                "available": False,
+                "reason": "fora_horario_comercial",
                 "details": (
-                    f"Horário disponível: {start_dt.strftime('%d/%m/%Y %H:%M')} "
-                    f"às {end_dt.strftime('%H:%M')}."
+                    f"Janela muito curta para encaixar um atendimento de "
+                    f"{duration_minutes}min antes das {ready_dt.strftime('%H:%M')}."
                 ),
             }
 
+        # Busca eventos do dia
+        try:
+            all_day_blocked, busy = self._fetch_day_events(target_date)
         except HttpError as e:
-            logger.error(f"Google Calendar API error: {e.status_code} {e.reason}")
+            logger.error(f"Google Calendar API: {e.status_code} {e.reason}")
             return {
                 "available": False,
                 "reason": "erro",
-                "details": "Erro ao consultar agenda. Sem confirmação de disponibilidade.",
+                "details": "Erro ao consultar agenda.",
             }
         except Exception as e:
-            logger.exception(f"Erro no calendar.is_available: {e}")
+            logger.exception(f"Calendar.find_available_slot: {e}")
             return {
                 "available": False,
                 "reason": "erro",
-                "details": "Erro ao consultar agenda. Sem confirmação de disponibilidade.",
+                "details": "Erro ao consultar agenda.",
             }
+
+        if all_day_blocked:
+            return {
+                "available": False,
+                "reason": "dia_bloqueado",
+                "details": (
+                    f"Há um evento de dia inteiro na agenda em {target_date}, "
+                    f"bloqueando todo o dia."
+                ),
+            }
+
+        # Itera slots possíveis: começa em window_start e avança de SLOT_STEP em SLOT_STEP,
+        # cada slot dura `duration_minutes`. Slot é válido se:
+        #  - termina <= window_end (ou seja, slot_start + duration <= ready_dt)
+        #  - NÃO sobrepõe nenhum evento ocupado
+        slot_start = window_start
+        slot_step = timedelta(minutes=SLOT_STEP_MINUTES)
+        slot_duration = timedelta(minutes=duration_minutes)
+
+        while slot_start + slot_duration <= window_end:
+            slot_end = slot_start + slot_duration
+            if not self._slot_overlaps_busy(slot_start, slot_end, busy):
+                # Achou um slot livre!
+                return {
+                    "available": True,
+                    "reason": "ok",
+                    "details": (
+                        f"Há disponibilidade na janela "
+                        f"{window_start.strftime('%H:%M')}–{window_end.strftime('%H:%M')} "
+                        f"do dia {target_date.strftime('%d/%m/%Y')}."
+                    ),
+                }
+            slot_start += slot_step
+
+        # Iterou tudo e não achou
+        return {
+            "available": False,
+            "reason": "horario_ocupado",
+            "details": (
+                f"Janela {window_start.strftime('%H:%M')}–{window_end.strftime('%H:%M')} "
+                f"do dia {target_date.strftime('%d/%m/%Y')} está totalmente ocupada."
+            ),
+        }
 
 
 calendar_service = CalendarService()

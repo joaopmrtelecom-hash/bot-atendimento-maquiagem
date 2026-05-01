@@ -8,7 +8,7 @@ from app.services.calendar import calendar_service
 from app.services.claude import claude
 from app.services.memory import Intent, memory
 from app.services.prompts.objection_followup import OBJECTION_FOLLOWUP_SYSTEM_PROMPT
-from app.services.prompts.social import SOCIAL_SYSTEM_PROMPT, SOCIAL_TOOLS
+from app.services.prompts.social import SOCIAL_TOOLS, get_social_system_prompt
 from app.services.prompts.welcome import WELCOME_SYSTEM_PROMPT
 from app.services.router import router as intent_router
 from app.services.whatsapp import whatsapp
@@ -30,52 +30,52 @@ INDISPONIBILIDADE_MARKER = "[AGENDA_INDISPONIVEL]"
 
 
 def _is_social_handoff(reply: str) -> bool:
-    """Detecta se a resposta indica handoff (etapa 5 do social)."""
     lower = reply.lower()
     return any(marker in lower for marker in HANDOFF_MARKERS)
 
 
 def _has_indisponibilidade_marker(reply: str) -> bool:
-    """Detecta se a resposta inclui o marcador de agenda indisponível."""
     return INDISPONIBILIDADE_MARKER in reply
 
 
 def _strip_marker(reply: str) -> str:
-    """Remove o marcador de indisponibilidade antes de enviar pra cliente."""
     return reply.replace(INDISPONIBILIDADE_MARKER, "").strip()
 
 
-# Mapeia intent -> (system_prompt, nome_do_agente, tools)
-AGENT_CONFIG: dict[Intent, tuple[str, str, list | None]] = {
-    "unknown": (WELCOME_SYSTEM_PROMPT, "welcome", None),
-    "social": (SOCIAL_SYSTEM_PROMPT, "social", SOCIAL_TOOLS),
-    "objection_followup": (OBJECTION_FOLLOWUP_SYSTEM_PROMPT, "objection_followup", None),
-}
+# Builder de configuração por agente. Permite system prompt dinâmico.
+def _agent_config(intent: Intent) -> tuple[str, str, list | None]:
+    """Retorna (system_prompt, agent_name, tools) pra cada intent."""
+    if intent == "unknown":
+        return (WELCOME_SYSTEM_PROMPT, "welcome", None)
+    if intent == "social":
+        return (get_social_system_prompt(), "social", SOCIAL_TOOLS)
+    if intent == "objection_followup":
+        return (OBJECTION_FOLLOWUP_SYSTEM_PROMPT, "objection_followup", None)
+    raise KeyError(f"Sem agente configurado pra intent: {intent}")
 
 
 # ============================================================
-# Tool executor: implementa as tools disponíveis pros agentes
+# Tool executor
 # ============================================================
 async def _execute_tool(tool_name: str, tool_input: dict) -> dict:
     """
     Despacha tool calls do Claude pra implementação concreta.
-    Retorna um dict que será serializado e devolvido ao modelo.
     """
     if tool_name == "verificar_disponibilidade":
         data_str = tool_input.get("data")
-        hora_str = tool_input.get("hora_inicio")
+        hora_str = tool_input.get("hora_pronta")
         duracao = tool_input.get("duracao_minutos", 60)
 
         if not data_str or not hora_str:
             return {
                 "available": False,
                 "reason": "input_invalido",
-                "details": "Faltou data ou hora_inicio.",
+                "details": "Faltou data ou hora_pronta.",
             }
 
         try:
             tz = ZoneInfo(settings.studio_timezone)
-            start_dt = datetime.fromisoformat(f"{data_str}T{hora_str}").replace(tzinfo=tz)
+            ready_dt = datetime.fromisoformat(f"{data_str}T{hora_str}").replace(tzinfo=tz)
         except ValueError as e:
             logger.warning(f"Tool verificar_disponibilidade: data/hora inválidas | {e}")
             return {
@@ -84,7 +84,9 @@ async def _execute_tool(tool_name: str, tool_input: dict) -> dict:
                 "details": f"Data ou hora em formato inválido: {data_str} {hora_str}",
             }
 
-        result = calendar_service.is_available(start_dt, duration_minutes=duracao)
+        result = calendar_service.find_available_slot(
+            ready_dt=ready_dt, duration_minutes=duracao,
+        )
         return result
 
     return {"error": f"tool desconhecida: {tool_name}"}
@@ -99,7 +101,6 @@ async def verify_webhook(
     hub_verify_token: str = Query(alias="hub.verify_token"),
     hub_challenge: str = Query(alias="hub.challenge"),
 ) -> int:
-    """Verificação do webhook pela Meta (handshake inicial)."""
     if hub_mode == "subscribe" and hub_verify_token == settings.webhook_verify_token:
         logger.info("Webhook verificado com sucesso pela Meta")
         return int(hub_challenge)
@@ -113,7 +114,6 @@ async def verify_webhook(
 
 @router.post("/webhook")
 async def receive_message(request: Request) -> dict:
-    """Recebe eventos do WhatsApp."""
     payload = await request.json()
     logger.info(f"Webhook recebido: {payload}")
 
@@ -179,7 +179,7 @@ async def receive_message(request: Request) -> dict:
         )
 
         # 4) Dispara agente correspondente
-        system_prompt, agent_name, tools = AGENT_CONFIG[intent]
+        system_prompt, agent_name, tools = _agent_config(intent)
         result = await claude.generate_reply(
             system_prompt=system_prompt,
             user_message=body,
